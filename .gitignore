@@ -1,0 +1,89 @@
+# ------------------------------
+# OS / File Explorer
+# ------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ------------------------------
+# Editors / IDE
+# ------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ------------------------------
+# Logs
+# ------------------------------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ------------------------------
+# Environment / secrets
+# ------------------------------
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# ------------------------------
+# Python
+# ------------------------------
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.python-version
+
+.venv/
+venv/
+env/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# ------------------------------
+# Node / React / Vite / TypeScript
+# ------------------------------
+node_modules/
+ui/node_modules/
+ui/dist/
+ui/.vite/
+*.tsbuildinfo
+
+# ------------------------------
+# JS test coverage
+# ------------------------------
+coverage/
+.nyc_output/
+
+# ------------------------------
+# Runtime / temp
+# ------------------------------
+*.pid
+*.sqlite3
+.cache/
+tmp/
+temp/
+
+# ------------------------------
+# Project-specific simulation outputs
+# ------------------------------
+server/csv_result/*
+!server/csv_result/.gitkeep
