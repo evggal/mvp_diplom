@@ -1,10 +1,27 @@
-export type DistributionType = "normal" | "exponential" | "uniform" | "deterministic";
+export type DistributionType =
+  | "normal"
+  | "exponential"
+  | "uniform"
+  | "deterministic"
+  | "poisson"
+  | "erlang"
+  | "hyperexponential"
+  | "intervals"
+  | "intensity";
+export type NodeType = "service" | "generator" | "exit";
 
 export interface DistributionConfig {
   distribution_type: DistributionType;
   mean?: number;
   std?: number;
   scale?: number;
+  rate?: number;
+  shape?: number;
+  rate1?: number;
+  rate2?: number;
+  mix_probability?: number;
+  intervals?: number[];
+  intensity?: number;
   low?: number;
   high?: number;
   value?: number;
@@ -20,10 +37,11 @@ export interface RouteConfig {
 export interface NodeConfig {
   node_id: string;
   name: string;
+  node_type: NodeType;
   open_time: number;
   close_time: number | null;
   channels: number;
-  service_distribution: DistributionConfig;
+  service_distribution: DistributionConfig | null;
   routes: RouteConfig[];
 }
 

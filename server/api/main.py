@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from modeling import ListSavedRuns, LoadRun
+from modeling import DeleteRun, ListSavedRuns, LoadRun
 from modeling.schemas import SimulationRunRequest
 
 from .auth import (
@@ -125,3 +125,22 @@ def GetModelData(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
+
+
+@app.delete("/models/{run_id}")
+def DeleteModel(
+    run_id: str,
+    user: str = Depends(GetCurrentUser),  # noqa: ARG001
+) -> dict[str, str]:
+    try:
+        DeleteRun(run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+    return {
+        "status": "deleted",
+        "run_id": run_id,
+    }

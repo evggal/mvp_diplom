@@ -1,6 +1,7 @@
 import { FormEvent, useState } from "react";
 import { AxiosError } from "axios";
 import { Login } from "../api/client";
+import { DismissibleError } from "../components/DismissibleError";
 
 interface LoginPageProps {
   on_success: () => void;
@@ -49,7 +50,7 @@ export function LoginPage({ on_success }: LoginPageProps) {
             {loading ? "Выполняется вход..." : "Войти"}
           </button>
         </form>
-        {error ? <div className="error-box">{error}</div> : null}
+        <DismissibleError message={error} on_dismiss={() => setError(null)} />
       </div>
     </div>
   );

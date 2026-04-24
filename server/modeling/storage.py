@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -116,3 +117,18 @@ def LoadRun(run_id: str) -> dict[str, Any]:
         "events": events_df.to_dict(orient="records"),
         "metrics": metrics_df.to_dict(orient="records"),
     }
+
+
+def DeleteRun(run_id: str) -> None:
+    root = GetResultsRoot().resolve()
+    run_dir = (root / run_id).resolve()
+
+    try:
+        run_dir.relative_to(root)
+    except ValueError as exc:
+        raise FileNotFoundError(f"Run '{run_id}' does not exist") from exc
+
+    if not run_dir.exists() or not run_dir.is_dir():
+        raise FileNotFoundError(f"Run '{run_id}' does not exist")
+
+    shutil.rmtree(run_dir)

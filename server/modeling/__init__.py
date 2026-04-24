@@ -1,6 +1,6 @@
 from .schemas import SimulationConfig, SimulationRunRequest
 from .simulator import RunSimulation
-from .storage import ListSavedRuns, LoadRun, SaveRunArtifacts
+from .storage import DeleteRun, ListSavedRuns, LoadRun, SaveRunArtifacts
 
 __all__ = [
     "SimulationConfig",
@@ -8,5 +8,6 @@ __all__ = [
     "RunSimulation",
     "ListSavedRuns",
     "LoadRun",
+    "DeleteRun",
     "SaveRunArtifacts",
 ]

@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .distributions import SampleFromDistribution
-from .schemas import EdgeConfig, RouteConfig, SimulationConfig
+from .schemas import DistributionConfig, EdgeConfig, NodeConfig, RouteConfig, SimulationConfig
 
 
 EVENT_REQUEST_GENERATED = "request_generated"
@@ -86,6 +86,27 @@ def NormalizeDelay(value: float) -> float:
     return value
 
 
+def SampleGeneratorInterarrivalDelay(
+    distribution: DistributionConfig,
+    rng: np.random.Generator,
+    interval_index_ref: list[int],
+) -> float:
+    if distribution.distribution_type != "intervals":
+        return NormalizeDelay(SampleFromDistribution(distribution, rng))
+
+    intervals = distribution.intervals
+    if not intervals and distribution.value is not None:
+        intervals = [distribution.value]
+
+    valid_intervals = [item for item in (intervals or []) if item > 0]
+    if not valid_intervals:
+        valid_intervals = [1.0]
+
+    index = interval_index_ref[0] % len(valid_intervals)
+    interval_index_ref[0] += 1
+    return NormalizeDelay(float(valid_intervals[index]))
+
+
 def SelectRoute(routes: list[RouteConfig], rng: np.random.Generator) -> RouteConfig:
     total = sum(route.probability for route in routes)
     threshold = float(rng.uniform(0.0, total))
@@ -128,17 +149,83 @@ def AppendEvent(
     )
 
 
+def ScheduleRequestByRoute(
+    route: RouteConfig,
+    request_id: str,
+    current_time: float,
+    from_node_id: str,
+    simulation_duration: float,
+    edge_lookup: dict[str, EdgeConfig],
+    rng: np.random.Generator,
+    calendar: list[CalendarEvent],
+    sequence_ref: list[int],
+) -> None:
+    if route.target_node_id is None:
+        sequence_ref[0] += 1
+        heapq.heappush(
+            calendar,
+            CalendarEvent(
+                event_time=current_time,
+                sequence=sequence_ref[0],
+                event_type=EVENT_REQUEST_EXITED,
+                request_id=request_id,
+                node_id=from_node_id,
+                from_node_id=from_node_id,
+            ),
+        )
+        return
+
+    edge = FindEdge(edge_lookup, route.edge_id or "")
+    travel_delay = NormalizeDelay(SampleFromDistribution(edge.travel_distribution, rng))
+    arrival_time = current_time + travel_delay
+
+    if arrival_time <= simulation_duration:
+        sequence_ref[0] += 1
+        heapq.heappush(
+            calendar,
+            CalendarEvent(
+                event_time=arrival_time,
+                sequence=sequence_ref[0],
+                event_type=EVENT_REQUEST_ARRIVED,
+                request_id=request_id,
+                node_id=route.target_node_id,
+                from_node_id=from_node_id,
+                to_node_id=route.target_node_id,
+                details=f"edge={edge.edge_id}",
+            ),
+        )
+        return
+
+    sequence_ref[0] += 1
+    heapq.heappush(
+        calendar,
+        CalendarEvent(
+            event_time=simulation_duration,
+            sequence=sequence_ref[0],
+            event_type=EVENT_REQUEST_EXITED,
+            request_id=request_id,
+            node_id=from_node_id,
+            from_node_id=from_node_id,
+            details="exit_on_timeout",
+        ),
+    )
+
+
 def StartServiceIfPossible(
     node: NodeRuntime,
     node_routes: list[RouteConfig],
+    node_config_lookup: dict[str, NodeConfig],
     current_time: float,
     simulation_duration: float,
-    config: SimulationConfig,
     calendar: list[CalendarEvent],
     sequence_ref: list[int],
     rng: np.random.Generator,
     event_rows: list[dict[str, Any]],
 ) -> None:
+    node_config = node_config_lookup[node.node_id]
+    if node_config.node_type != "service":
+        return
+
     if current_time < node.open_time:
         sequence_ref[0] += 1
         heapq.heappush(
@@ -178,9 +265,9 @@ def StartServiceIfPossible(
             to_node_id=node.node_id,
         )
 
-        service_distribution = next(
-            item.service_distribution for item in config.nodes if item.node_id == node.node_id
-        )
+        service_distribution = node_config.service_distribution
+        if service_distribution is None:
+            continue
         service_delay = NormalizeDelay(SampleFromDistribution(service_distribution, rng))
         finish_time = current_time + service_delay
 
@@ -204,8 +291,10 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
     simulation_duration = config.simulation_duration
 
     node_lookup: dict[str, NodeRuntime] = {}
+    node_config_lookup: dict[str, NodeConfig] = {}
     node_routes_lookup: dict[str, list[RouteConfig]] = {}
     for node_config in config.nodes:
+        node_config_lookup[node_config.node_id] = node_config
         node_lookup[node_config.node_id] = NodeRuntime(
             node_id=node_config.node_id,
             name=node_config.name,
@@ -220,6 +309,7 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
 
     calendar: list[CalendarEvent] = []
     sequence_ref = [0]
+    generator_interval_index_ref = [0]
     event_rows: list[dict[str, Any]] = []
 
     stop_generation_time = (
@@ -288,8 +378,10 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
                 ),
             )
 
-            interarrival_delay = NormalizeDelay(
-                SampleFromDistribution(config.generator.interarrival_distribution, rng)
+            interarrival_delay = SampleGeneratorInterarrivalDelay(
+                config.generator.interarrival_distribution,
+                rng,
+                generator_interval_index_ref,
             )
             next_generation_time = current_time + interarrival_delay
             if next_generation_time <= stop_generation_time:
@@ -307,7 +399,57 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
 
         if event.event_type == EVENT_REQUEST_ARRIVED and event.node_id and event.request_id:
             node = node_lookup[event.node_id]
+            node_config = node_config_lookup[event.node_id]
             node.arrivals += 1
+
+            if node_config.node_type == "exit":
+                AppendEvent(
+                    event_rows=event_rows,
+                    event_time=current_time,
+                    event_type=EVENT_REQUEST_ARRIVED,
+                    request_id=event.request_id,
+                    node=node,
+                    from_node_id=event.from_node_id,
+                    to_node_id=node.node_id,
+                )
+                sequence_ref[0] += 1
+                heapq.heappush(
+                    calendar,
+                    CalendarEvent(
+                        event_time=current_time,
+                        sequence=sequence_ref[0],
+                        event_type=EVENT_REQUEST_EXITED,
+                        request_id=event.request_id,
+                        node_id=node.node_id,
+                        from_node_id=event.from_node_id or node.node_id,
+                    ),
+                )
+                continue
+
+            if node_config.node_type == "generator":
+                AppendEvent(
+                    event_rows=event_rows,
+                    event_time=current_time,
+                    event_type=EVENT_REQUEST_ARRIVED,
+                    request_id=event.request_id,
+                    node=node,
+                    from_node_id=event.from_node_id,
+                    to_node_id=node.node_id,
+                )
+                route = SelectRoute(node_routes_lookup[node.node_id], rng)
+                ScheduleRequestByRoute(
+                    route=route,
+                    request_id=event.request_id,
+                    current_time=current_time,
+                    from_node_id=node.node_id,
+                    simulation_duration=simulation_duration,
+                    edge_lookup=edge_lookup,
+                    rng=rng,
+                    calendar=calendar,
+                    sequence_ref=sequence_ref,
+                )
+                continue
+
             node.queue.append(event.request_id)
             node.queue_arrival_times[event.request_id] = current_time
             node.UpdateQueueState(current_time)
@@ -325,9 +467,9 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
             StartServiceIfPossible(
                 node=node,
                 node_routes=node_routes_lookup[node.node_id],
+                node_config_lookup=node_config_lookup,
                 current_time=current_time,
                 simulation_duration=simulation_duration,
-                config=config,
                 calendar=calendar,
                 sequence_ref=sequence_ref,
                 rng=rng,
@@ -340,9 +482,9 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
             StartServiceIfPossible(
                 node=node,
                 node_routes=node_routes_lookup[node.node_id],
+                node_config_lookup=node_config_lookup,
                 current_time=current_time,
                 simulation_duration=simulation_duration,
-                config=config,
                 calendar=calendar,
                 sequence_ref=sequence_ref,
                 rng=rng,
@@ -375,59 +517,24 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
             )
 
             route = SelectRoute(node_routes_lookup[node.node_id], rng)
-            if route.target_node_id is None:
-                sequence_ref[0] += 1
-                heapq.heappush(
-                    calendar,
-                    CalendarEvent(
-                        event_time=current_time,
-                        sequence=sequence_ref[0],
-                        event_type=EVENT_REQUEST_EXITED,
-                        request_id=request_id,
-                        node_id=node.node_id,
-                        from_node_id=node.node_id,
-                    ),
-                )
-            else:
-                edge = FindEdge(edge_lookup, route.edge_id or "")
-                travel_delay = NormalizeDelay(SampleFromDistribution(edge.travel_distribution, rng))
-                arrival_time = current_time + travel_delay
-                if arrival_time <= simulation_duration:
-                    sequence_ref[0] += 1
-                    heapq.heappush(
-                        calendar,
-                        CalendarEvent(
-                            event_time=arrival_time,
-                            sequence=sequence_ref[0],
-                            event_type=EVENT_REQUEST_ARRIVED,
-                            request_id=request_id,
-                            node_id=route.target_node_id,
-                            from_node_id=node.node_id,
-                            to_node_id=route.target_node_id,
-                            details=f"edge={edge.edge_id}",
-                        ),
-                    )
-                else:
-                    sequence_ref[0] += 1
-                    heapq.heappush(
-                        calendar,
-                        CalendarEvent(
-                            event_time=simulation_duration,
-                            sequence=sequence_ref[0],
-                            event_type=EVENT_REQUEST_EXITED,
-                            request_id=request_id,
-                            node_id=node.node_id,
-                            from_node_id=node.node_id,
-                            details="exit_on_timeout",
-                        ),
-                    )
+            ScheduleRequestByRoute(
+                route=route,
+                request_id=request_id,
+                current_time=current_time,
+                from_node_id=node.node_id,
+                simulation_duration=simulation_duration,
+                edge_lookup=edge_lookup,
+                rng=rng,
+                calendar=calendar,
+                sequence_ref=sequence_ref,
+            )
 
             StartServiceIfPossible(
                 node=node,
                 node_routes=node_routes_lookup[node.node_id],
+                node_config_lookup=node_config_lookup,
                 current_time=current_time,
                 simulation_duration=simulation_duration,
-                config=config,
                 calendar=calendar,
                 sequence_ref=sequence_ref,
                 rng=rng,
