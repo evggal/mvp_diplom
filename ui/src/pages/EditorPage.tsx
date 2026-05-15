@@ -2,6 +2,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { AxiosError } from "axios";
@@ -12,13 +13,15 @@ import {
   BuildBaseTemplate,
   requests_options,
   time_step_options,
-  type NodePosition,
 } from "../model/defaultModel";
 import type {
   DistributionConfig,
   DistributionType,
   EdgeConfig,
+  GeneratorConfig,
+  NodePosition,
   NodeConfig,
+  NodeScheduleInterval,
   NodeType,
   RouteConfig,
   SimulationConfig,
@@ -62,8 +65,8 @@ interface DistributionEditorProps {
 
 type EditorSettingsTab = "general" | "nodes";
 
-const node_box_width = 192;
-const node_box_height = 104;
+const node_box_width = 168;
+const node_box_height = 92;
 const world_width = 2400;
 const world_height = 1600;
 const min_canvas_zoom = 0.45;
@@ -100,7 +103,7 @@ function CloneConfig(config: SimulationConfig): SimulationConfig {
 }
 
 function CreateServiceNodeName(index: number): string {
-  return `Узел обслуживания ${index}`;
+  return `РЈР·РµР» РѕР±СЃР»СѓР¶РёРІР°РЅРёСЏ ${index}`;
 }
 
 function CreateDistributionByType(
@@ -223,6 +226,19 @@ function CreateInterarrivalDistribution(): DistributionConfig {
   };
 }
 
+function EnsureGeneratorConfig(config: SimulationConfig): GeneratorConfig {
+  if (!config.generator) {
+    const generator_node = config.nodes.find((node) => node.node_type === "generator") ?? config.nodes[0];
+    config.generator = {
+      target_node_id: generator_node?.node_id ?? "node_1",
+      start_time: 0,
+      stop_time: Math.max(5, config.simulation_duration - 10),
+      interarrival_distribution: CreateInterarrivalDistribution(),
+    };
+  }
+  return config.generator;
+}
+
 function CreateNodeId(config: SimulationConfig): string {
   const existing_ids = new Set(config.nodes.map((node) => node.node_id));
   let index = 1;
@@ -230,6 +246,66 @@ function CreateNodeId(config: SimulationConfig): string {
     index += 1;
   }
   return `node_${index}`;
+}
+
+function CreateDefaultSchedule(): NodeScheduleInterval[] {
+  return [{ open_time: 0, close_time: null }];
+}
+
+function NormalizeNodeSchedule(
+  schedule: NodeScheduleInterval[] | null | undefined,
+  fallback_open_time: number,
+  fallback_close_time: number | null,
+): NodeScheduleInterval[] {
+  const fallback_interval: NodeScheduleInterval = {
+    open_time: Math.max(0, fallback_open_time),
+    close_time:
+      fallback_close_time !== null && fallback_close_time > fallback_open_time
+        ? fallback_close_time
+        : null,
+  };
+  const source = schedule && schedule.length > 0 ? schedule : [fallback_interval];
+  const sorted = source
+    .map((interval) => {
+      const open_time = Number.isFinite(interval.open_time) ? Math.max(0, interval.open_time) : 0;
+      const close_time =
+        interval.close_time !== null && Number.isFinite(interval.close_time)
+          ? Math.max(0, interval.close_time)
+          : null;
+      return { open_time, close_time };
+    })
+    .sort((first, second) => first.open_time - second.open_time);
+
+  const normalized: NodeScheduleInterval[] = [];
+  for (const interval of sorted) {
+    const next_interval = { ...interval };
+    const previous_interval = normalized[normalized.length - 1];
+    if (previous_interval) {
+      if (previous_interval.close_time === null) {
+        break;
+      }
+      if (next_interval.open_time < previous_interval.close_time) {
+        next_interval.open_time = previous_interval.close_time;
+      }
+    }
+
+    if (next_interval.close_time !== null && next_interval.close_time <= next_interval.open_time) {
+      next_interval.close_time = next_interval.open_time + 0.1;
+    }
+
+    normalized.push(next_interval);
+    if (next_interval.close_time === null) {
+      break;
+    }
+  }
+
+  return normalized.length > 0 ? normalized : [fallback_interval];
+}
+
+function SyncLegacyScheduleFields(node: NodeConfig): void {
+  const first_interval = node.schedule?.[0] ?? { open_time: 0, close_time: null };
+  node.open_time = first_interval.open_time;
+  node.close_time = first_interval.close_time;
 }
 
 function CreateDefaultNode(
@@ -240,10 +316,11 @@ function CreateDefaultNode(
   if (node_type === "exit") {
     return {
       node_id,
-      name: node_name || "Выход из системы",
+      name: node_name || "Р’С‹С…РѕРґ РёР· СЃРёСЃС‚РµРјС‹",
       node_type: "exit",
       open_time: 0,
       close_time: null,
+      schedule: CreateDefaultSchedule(),
       channels: 1,
       service_distribution: null,
       routes: [],
@@ -253,10 +330,11 @@ function CreateDefaultNode(
   if (node_type === "generator") {
     return {
       node_id,
-      name: node_name || "Генератор заявок",
+      name: node_name || "Р“РµРЅРµСЂР°С‚РѕСЂ Р·Р°СЏРІРѕРє",
       node_type: "generator",
       open_time: 0,
       close_time: null,
+      schedule: CreateDefaultSchedule(),
       channels: 1,
       service_distribution: {
         distribution_type: "deterministic",
@@ -279,6 +357,7 @@ function CreateDefaultNode(
     node_type: "service",
     open_time: 0,
     close_time: null,
+    schedule: CreateDefaultSchedule(),
     channels: 1,
     service_distribution: CreateServiceDistribution(),
     routes: [
@@ -384,9 +463,9 @@ function NormalizeConfigAndLayout(
   const node_positions = { ...original_positions };
 
   if (config.nodes.length === 0) {
-    config.nodes.push(CreateDefaultNode("node_1", "Генератор заявок", "generator"));
+    config.nodes.push(CreateDefaultNode("node_1", "Р“РµРЅРµСЂР°С‚РѕСЂ Р·Р°СЏРІРѕРє", "generator"));
     config.nodes.push(CreateDefaultNode("node_2", CreateServiceNodeName(1), "service"));
-    config.nodes.push(CreateDefaultNode("node_3", "Выход из системы", "exit"));
+    config.nodes.push(CreateDefaultNode("node_3", "Р’С‹С…РѕРґ РёР· СЃРёСЃС‚РµРјС‹", "exit"));
     config.edges.push(CreateDefaultEdge("edge_1", "node_1", "node_2"));
     config.edges.push(CreateDefaultEdge("edge_2", "node_2", "node_3"));
     config.nodes[0].routes = [{ target_node_id: "node_2", edge_id: "edge_1", probability: 1 }];
@@ -414,7 +493,7 @@ function NormalizeConfigAndLayout(
     candidate.node_type = "generator";
     candidate.channels = 1;
     if (!candidate.name || candidate.name.trim().length === 0) {
-      candidate.name = "Генератор заявок";
+      candidate.name = "Р“РµРЅРµСЂР°С‚РѕСЂ Р·Р°СЏРІРѕРє";
     }
   }
 
@@ -422,7 +501,7 @@ function NormalizeConfigAndLayout(
   if (normalized_generator_nodes.length > 1) {
     normalized_generator_nodes.slice(1).forEach((node, index) => {
       node.node_type = "service";
-      if (!node.name || node.name === "Генератор заявок") {
+      if (!node.name || node.name === "Р“РµРЅРµСЂР°С‚РѕСЂ Р·Р°СЏРІРѕРє") {
         node.name = CreateServiceNodeName(index + 1);
       }
       if (!node.service_distribution) {
@@ -436,7 +515,7 @@ function NormalizeConfigAndLayout(
 
   if (!config.nodes.some((node) => node.node_type === "exit")) {
     const next_exit_id = CreateNodeId(config);
-    config.nodes.push(CreateDefaultNode(next_exit_id, "Выход из системы", "exit"));
+    config.nodes.push(CreateDefaultNode(next_exit_id, "Р’С‹С…РѕРґ РёР· СЃРёСЃС‚РµРјС‹", "exit"));
     node_positions[next_exit_id] = {
       x: 180 + (config.nodes.length % 4) * 240,
       y: 220 + Math.floor(config.nodes.length / 4) * 170,
@@ -458,10 +537,8 @@ function NormalizeConfigAndLayout(
       };
     }
     node.channels = Math.max(1, Math.round(node.channels));
-    node.open_time = Math.max(0, node.open_time);
-    if (node.close_time !== null && node.close_time <= node.open_time) {
-      node.close_time = null;
-    }
+    node.schedule = NormalizeNodeSchedule(node.schedule, node.open_time, node.close_time);
+    SyncLegacyScheduleFields(node);
 
     if (node.node_type === "exit") {
       node.channels = 1;
@@ -529,25 +606,34 @@ function NormalizeConfigAndLayout(
   }
 
   const generator_node = config.nodes.find((node) => node.node_type === "generator") ?? config.nodes[0];
-  config.generator.target_node_id = generator_node.node_id;
-  if (config.generator.start_time < 0) {
-    config.generator.start_time = 0;
+  const generator_config =
+    config.generator ??
+    {
+      target_node_id: generator_node.node_id,
+      start_time: 0,
+      stop_time: Math.max(5, config.simulation_duration - 10),
+      interarrival_distribution: CreateInterarrivalDistribution(),
+    };
+  config.generator = generator_config;
+  generator_config.target_node_id = generator_node.node_id;
+  if (generator_config.start_time < 0) {
+    generator_config.start_time = 0;
   }
   if (
-    config.generator.stop_time !== null &&
-    config.generator.stop_time <= config.generator.start_time
+    generator_config.stop_time !== null &&
+    generator_config.stop_time <= generator_config.start_time
   ) {
-    config.generator.stop_time = null;
+    generator_config.stop_time = null;
   }
   if (
-    config.generator.stop_time !== null &&
-    config.generator.stop_time > config.simulation_duration
+    generator_config.stop_time !== null &&
+    generator_config.stop_time > config.simulation_duration
   ) {
-    config.generator.stop_time = config.simulation_duration;
+    generator_config.stop_time = config.simulation_duration;
   }
 
-  config.generator.interarrival_distribution = NormalizeDistributionConfig(
-    config.generator.interarrival_distribution,
+  generator_config.interarrival_distribution = NormalizeDistributionConfig(
+    generator_config.interarrival_distribution,
     generator_distribution_types,
     "poisson",
   );
@@ -623,7 +709,7 @@ function ValidateProbabilitySums(config: SimulationConfig): string | null {
     }
     const sum = node.routes.reduce((accumulator, route) => accumulator + route.probability, 0);
     if (!IsProbabilitySumValid(sum)) {
-      return `Ошибка в вершине "${node.name}" (${node.node_id}): сумма вероятностей перехода должна быть 100%. Сейчас: ${(sum * 100).toFixed(2)}%.`;
+      return `РћС€РёР±РєР° РІ РІРµСЂС€РёРЅРµ "${node.name}" (${node.node_id}): СЃСѓРјРјР° РІРµСЂРѕСЏС‚РЅРѕСЃС‚РµР№ РїРµСЂРµС…РѕРґР° РґРѕР»Р¶РЅР° Р±С‹С‚СЊ 100%. РЎРµР№С‡Р°СЃ: ${(sum * 100).toFixed(2)}%.`;
     }
   }
   return null;
@@ -631,30 +717,30 @@ function ValidateProbabilitySums(config: SimulationConfig): string | null {
 
 function GetDistributionLabel(distribution_type: DistributionType): string {
   if (distribution_type === "normal") {
-    return "Нормальный";
+    return "РќРѕСЂРјР°Р»СЊРЅС‹Р№";
   }
   if (distribution_type === "uniform") {
-    return "Равномерный";
+    return "Р Р°РІРЅРѕРјРµСЂРЅС‹Р№";
   }
   if (distribution_type === "exponential") {
-    return "Экспоненциальный";
+    return "Р­РєСЃРїРѕРЅРµРЅС†РёР°Р»СЊРЅС‹Р№";
   }
   if (distribution_type === "deterministic") {
-    return "Детерминированный";
+    return "Р”РµС‚РµСЂРјРёРЅРёСЂРѕРІР°РЅРЅС‹Р№";
   }
   if (distribution_type === "poisson") {
-    return "Пуассоновский";
+    return "РџСѓР°СЃСЃРѕРЅРѕРІСЃРєРёР№";
   }
   if (distribution_type === "erlang") {
-    return "Поток Эрланга";
+    return "РџРѕС‚РѕРє Р­СЂР»Р°РЅРіР°";
   }
   if (distribution_type === "hyperexponential") {
-    return "Гиперэкспоненциальный";
+    return "Р“РёРїРµСЂСЌРєСЃРїРѕРЅРµРЅС†РёР°Р»СЊРЅС‹Р№";
   }
   if (distribution_type === "intervals") {
-    return "Через интервалы";
+    return "Р§РµСЂРµР· РёРЅС‚РµСЂРІР°Р»С‹";
   }
-  return "По интенсивности";
+  return "РџРѕ РёРЅС‚РµРЅСЃРёРІРЅРѕСЃС‚Рё";
 }
 
 function DistributionEditor({
@@ -697,7 +783,7 @@ function DistributionEditor({
       <h4>{title}</h4>
       <div className="editor-grid">
         <label>
-          Закон распределения
+          Р—Р°РєРѕРЅ СЂР°СЃРїСЂРµРґРµР»РµРЅРёСЏ
           <select
             value={distribution.distribution_type}
             onChange={(event) => HandleDistributionTypeChange(event.target.value as DistributionType)}
@@ -919,6 +1005,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
   const initial_template = useMemo(() => BuildBaseTemplate(), []);
   const navigate = useNavigate();
   const location = useLocation();
+  const canvas_panel_ref = useRef<HTMLDivElement | null>(null);
 
   const [model_name, setModelName] = useState(initial_template.model_name);
   const [config, setConfig] = useState<SimulationConfig>(initial_template.config);
@@ -941,11 +1028,26 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
   const [task_status, setTaskStatus] = useState<TaskStatusResponse | null>(null);
   const [active_settings_tab, setActiveSettingsTab] = useState<EditorSettingsTab>("nodes");
   const [selected_route_for_edge_settings, setSelectedRouteForEdgeSettings] = useState<string>("");
+  const [is_canvas_fullscreen, setIsCanvasFullscreen] = useState(false);
 
   const selected_node = useMemo(
     () => config.nodes.find((node) => node.node_id === selected_node_id) ?? null,
     [config.nodes, selected_node_id],
   );
+  const selected_node_schedule = useMemo(() => {
+    if (!selected_node) {
+      return [] as NodeScheduleInterval[];
+    }
+    return NormalizeNodeSchedule(
+      selected_node.schedule,
+      selected_node.open_time,
+      selected_node.close_time,
+    );
+  }, [selected_node]);
+  const can_add_schedule_interval = useMemo(() => {
+    const last_interval = selected_node_schedule[selected_node_schedule.length - 1];
+    return Boolean(last_interval && last_interval.close_time !== null);
+  }, [selected_node_schedule]);
 
   const base_run_id = useMemo(() => {
     const query = new URLSearchParams(location.search);
@@ -1177,8 +1279,9 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
       y: 220 + Math.floor(next_config.nodes.length / 4) * 170,
     };
 
-    if (!next_config.generator.target_node_id) {
-      next_config.generator.target_node_id = node_id;
+    const generator_config = EnsureGeneratorConfig(next_config);
+    if (!generator_config.target_node_id) {
+      generator_config.target_node_id = node_id;
     }
 
     CommitModel(next_config, next_positions);
@@ -1194,11 +1297,11 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
       return;
     }
     if (current_node.node_type === "generator") {
-      setError("Нельзя удалить единственный узел типа «Генератор заявок». Сначала назначьте другой узел генератором.");
+      setError("РќРµР»СЊР·СЏ СѓРґР°Р»РёС‚СЊ РµРґРёРЅСЃС‚РІРµРЅРЅС‹Р№ СѓР·РµР» С‚РёРїР° В«Р“РµРЅРµСЂР°С‚РѕСЂ Р·Р°СЏРІРѕРєВ». РЎРЅР°С‡Р°Р»Р° РЅР°Р·РЅР°С‡СЊС‚Рµ РґСЂСѓРіРѕР№ СѓР·РµР» РіРµРЅРµСЂР°С‚РѕСЂРѕРј.");
       return;
     }
     if (current_node.node_type === "exit" && config.nodes.filter((node) => node.node_type === "exit").length <= 1) {
-      setError("В модели должен оставаться хотя бы один узел типа «Выход из системы».");
+      setError("Р’ РјРѕРґРµР»Рё РґРѕР»Р¶РµРЅ РѕСЃС‚Р°РІР°С‚СЊСЃСЏ С…РѕС‚СЏ Р±С‹ РѕРґРёРЅ СѓР·РµР» С‚РёРїР° В«Р’С‹С…РѕРґ РёР· СЃРёСЃС‚РµРјС‹В».");
       return;
     }
     const next_config = CloneConfig(config);
@@ -1242,8 +1345,8 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
 
     if (next_type === "generator") {
       node.channels = 1;
-      if (!node.name || node.name.trim().length === 0 || node.name === "Выход из системы") {
-        node.name = "Генератор заявок";
+      if (!node.name || node.name.trim().length === 0 || node.name === "Р’С‹С…РѕРґ РёР· СЃРёСЃС‚РµРјС‹") {
+        node.name = "Р“РµРЅРµСЂР°С‚РѕСЂ Р·Р°СЏРІРѕРє";
       }
       if (!node.service_distribution) {
         node.service_distribution = {
@@ -1255,20 +1358,20 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
       if (node.routes.length === 0) {
         node.routes = [{ target_node_id: null, edge_id: null, probability: 1 }];
       }
-      next_config.generator.target_node_id = node.node_id;
+      EnsureGeneratorConfig(next_config).target_node_id = node.node_id;
     }
 
     if (next_type === "exit") {
       node.channels = 1;
       node.routes = [];
       node.service_distribution = null;
-      if (!node.name || node.name.trim().length === 0 || node.name === "Генератор заявок") {
-        node.name = "Выход из системы";
+      if (!node.name || node.name.trim().length === 0 || node.name === "Р“РµРЅРµСЂР°С‚РѕСЂ Р·Р°СЏРІРѕРє") {
+        node.name = "Р’С‹С…РѕРґ РёР· СЃРёСЃС‚РµРјС‹";
       }
     }
 
     if (next_type === "service") {
-      if (!node.name || node.name === "Генератор заявок" || node.name === "Выход из системы") {
+      if (!node.name || node.name === "Р“РµРЅРµСЂР°С‚РѕСЂ Р·Р°СЏРІРѕРє" || node.name === "Р’С‹С…РѕРґ РёР· СЃРёСЃС‚РµРјС‹") {
         const service_nodes_count = next_config.nodes.filter(
           (candidate) => candidate.node_type === "service",
         ).length;
@@ -1283,6 +1386,73 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
     }
 
     CommitModel(next_config, { ...node_positions });
+  }
+
+  function HandleAddScheduleInterval() {
+    if (!selected_node_id) {
+      return;
+    }
+    UpdateSelectedNode((node) => {
+      const current_schedule = NormalizeNodeSchedule(node.schedule, node.open_time, node.close_time);
+      const last_interval = current_schedule[current_schedule.length - 1];
+      if (!last_interval || last_interval.close_time === null) {
+        return;
+      }
+      const next_open_time = last_interval.close_time + 1;
+      current_schedule.push({
+        open_time: next_open_time,
+        close_time: next_open_time + 10,
+      });
+      node.schedule = NormalizeNodeSchedule(current_schedule, node.open_time, node.close_time);
+      SyncLegacyScheduleFields(node);
+    });
+  }
+
+  function HandleRemoveScheduleInterval(interval_index: number) {
+    if (!selected_node_id) {
+      return;
+    }
+    UpdateSelectedNode((node) => {
+      const current_schedule = NormalizeNodeSchedule(node.schedule, node.open_time, node.close_time);
+      if (current_schedule.length <= 1) {
+        return;
+      }
+      node.schedule = NormalizeNodeSchedule(
+        current_schedule.filter((_, index) => index !== interval_index),
+        node.open_time,
+        node.close_time,
+      );
+      SyncLegacyScheduleFields(node);
+    });
+  }
+
+  function HandleScheduleIntervalChange(
+    interval_index: number,
+    field_name: "open_time" | "close_time",
+    raw_value: string,
+  ) {
+    if (!selected_node_id) {
+      return;
+    }
+    UpdateSelectedNode((node) => {
+      const current_schedule = NormalizeNodeSchedule(node.schedule, node.open_time, node.close_time);
+      const interval = current_schedule[interval_index];
+      if (!interval) {
+        return;
+      }
+      if (field_name === "open_time") {
+        const parsed = ParseOptionalNumber(raw_value);
+        if (parsed === null) {
+          return;
+        }
+        interval.open_time = Math.max(0, parsed);
+      } else {
+        const parsed = ParseOptionalNumber(raw_value);
+        interval.close_time = parsed === null ? null : Math.max(0, parsed);
+      }
+      node.schedule = NormalizeNodeSchedule(current_schedule, node.open_time, node.close_time);
+      SyncLegacyScheduleFields(node);
+    });
   }
 
   function HandleAddRouteForSelectedNode() {
@@ -1376,6 +1546,24 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
     setCanvasZoom(ClampZoom(next_zoom));
   }
 
+  async function HandleToggleCanvasFullscreen() {
+    const canvas_panel = canvas_panel_ref.current;
+    if (!canvas_panel) {
+      return;
+    }
+
+    try {
+      if (document.fullscreenElement === canvas_panel) {
+        await document.exitFullscreen();
+        return;
+      }
+
+      await canvas_panel.requestFullscreen();
+    } catch {
+      setError("РќРµ СѓРґР°Р»РѕСЃСЊ РїРµСЂРµРєР»СЋС‡РёС‚СЊ РїРѕР»РЅРѕСЌРєСЂР°РЅРЅС‹Р№ СЂРµР¶РёРј СЃС…РµРјС‹.");
+    }
+  }
+
   function HandleCanvasMouseDown(event: ReactMouseEvent<HTMLDivElement>) {
     if (event.button !== 0) {
       return;
@@ -1457,6 +1645,19 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
   }, [canvas_zoom, interaction_state]);
 
   useEffect(() => {
+    function HandleFullscreenChange() {
+      const canvas_panel = canvas_panel_ref.current;
+      setIsCanvasFullscreen(Boolean(canvas_panel && document.fullscreenElement === canvas_panel));
+    }
+
+    document.addEventListener("fullscreenchange", HandleFullscreenChange);
+    HandleFullscreenChange();
+    return () => {
+      document.removeEventListener("fullscreenchange", HandleFullscreenChange);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!has_active_task || !task_status?.task_id) {
       return;
     }
@@ -1477,7 +1678,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
           return;
         }
         const request_error = poll_error as AxiosError<{ detail?: string }>;
-        setError(request_error.response?.data?.detail ?? "Не удалось обновить статус задачи");
+        setError(request_error.response?.data?.detail ?? "РќРµ СѓРґР°Р»РѕСЃСЊ РѕР±РЅРѕРІРёС‚СЊ СЃС‚Р°С‚СѓСЃ Р·Р°РґР°С‡Рё");
       }
     }, 1200);
 
@@ -1493,7 +1694,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
     try {
       const trimmed_model_name = model_name.trim();
       if (trimmed_model_name.length === 0) {
-        setError("Введите название модели.");
+        setError("Р’РІРµРґРёС‚Рµ РЅР°Р·РІР°РЅРёРµ РјРѕРґРµР»Рё.");
         return;
       }
 
@@ -1529,7 +1730,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
         const detail = error_response.response.data.detail;
         setError(typeof detail === "string" ? detail : JSON.stringify(detail));
       } else {
-        setError("Не удалось запустить моделирование.");
+        setError("РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ РјРѕРґРµР»РёСЂРѕРІР°РЅРёРµ.");
       }
     } finally {
       setLoading(false);
@@ -1568,29 +1769,29 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
   return (
     <section className="page-panel editor-page-shell">
       <div className="editor-header">
-        <h2>Визуальный редактор модели</h2>
+        <h2>Р’РёР·СѓР°Р»СЊРЅС‹Р№ СЂРµРґР°РєС‚РѕСЂ РјРѕРґРµР»Рё</h2>
         <p>
-          Перетаскивайте узлы мышью. Для перемещения всей схемы зажмите левую кнопку на пустом
-          месте холста и тяните.
+          РџРµСЂРµС‚Р°СЃРєРёРІР°Р№С‚Рµ СѓР·Р»С‹ РјС‹С€СЊСЋ. Р”Р»СЏ РїРµСЂРµРјРµС‰РµРЅРёСЏ РІСЃРµР№ СЃС…РµРјС‹ Р·Р°Р¶РјРёС‚Рµ Р»РµРІСѓСЋ РєРЅРѕРїРєСѓ РЅР° РїСѓСЃС‚РѕРј
+          РјРµСЃС‚Рµ С…РѕР»СЃС‚Р° Рё С‚СЏРЅРёС‚Рµ.
         </p>
       </div>
 
       <div className="editor-sticky-actions">
         <div className="editor-sticky-main">
           <button onClick={HandleStartModeling} disabled={loading || has_active_task}>
-            {loading ? "Запуск..." : "Моделирование"}
+            {loading ? "Р—Р°РїСѓСЃРє..." : "РњРѕРґРµР»РёСЂРѕРІР°РЅРёРµ"}
           </button>
           {task_status?.run_id ? (
             <button onClick={() => navigate(`/results/${task_status.run_id}`)}>
-              Результаты моделирования
+              Р РµР·СѓР»СЊС‚Р°С‚С‹ РјРѕРґРµР»РёСЂРѕРІР°РЅРёСЏ
             </button>
           ) : null}
         </div>
         <div className="editor-sticky-meta">
-          <span>Масштаб: {Math.round(canvas_zoom * 100)}%</span>
+          <span>РњР°СЃС€С‚Р°Р±: {Math.round(canvas_zoom * 100)}%</span>
           {task_status ? (
             <span>
-              Статус: <strong>{task_status.status}</strong>
+              РЎС‚Р°С‚СѓСЃ: <strong>{task_status.status}</strong>
             </span>
           ) : null}
         </div>
@@ -1598,18 +1799,27 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
       </div>
 
       <div className="editor-layout">
-        <div className="editor-canvas-panel">
+        <div
+          ref={canvas_panel_ref}
+          className={`editor-canvas-panel ${is_canvas_fullscreen ? "is-fullscreen" : ""}`}
+        >
           <div className="canvas-toolbar">
             <button onClick={HandleRestoreDefault} type="button" className="secondary">
-              Сбросить схему
+              РЎР±СЂРѕСЃРёС‚СЊ СЃС…РµРјСѓ
             </button>
-
+            <button
+              onClick={() => void HandleToggleCanvasFullscreen()}
+              type="button"
+              className="secondary"
+            >
+              {is_canvas_fullscreen ? "Свернуть схему" : "Развернуть схему"}
+            </button>
             <div className="zoom-controls">
               <button
                 type="button"
                 className="secondary"
                 onClick={() => HandleSetZoom(canvas_zoom - 0.1)}
-                aria-label="Уменьшить масштаб"
+                aria-label="РЈРјРµРЅСЊС€РёС‚СЊ РјР°СЃС€С‚Р°Р±"
               >
                 -
               </button>
@@ -1625,7 +1835,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                 type="button"
                 className="secondary"
                 onClick={() => HandleSetZoom(canvas_zoom + 0.1)}
-                aria-label="Увеличить масштаб"
+                aria-label="РЈРІРµР»РёС‡РёС‚СЊ РјР°СЃС€С‚Р°Р±"
               >
                 +
               </button>
@@ -1633,7 +1843,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                 type="button"
                 className="secondary"
                 onClick={() => HandleSetZoom(1)}
-                aria-label="Сбросить масштаб"
+                aria-label="РЎР±СЂРѕСЃРёС‚СЊ РјР°СЃС€С‚Р°Р±"
               >
                 100%
               </button>
@@ -1713,11 +1923,11 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                   >
                     <span className="node-card-title">{node.name}</span>
                     <span className="node-card-meta">id: {node.node_id}</span>
-                    <span className="node-card-meta">Каналов: {node.channels}</span>
+                    <span className="node-card-meta">РљР°РЅР°Р»РѕРІ: {node.channels}</span>
                     {node.node_type === "generator" ? (
-                      <span className="generator-badge">Генератор</span>
+                      <span className="generator-badge">Р“РµРЅРµСЂР°С‚РѕСЂ</span>
                     ) : null}
-                    {node.node_type === "exit" ? <span className="exit-badge">Выход</span> : null}
+                    {node.node_type === "exit" ? <span className="exit-badge">Р’С‹С…РѕРґ</span> : null}
                   </button>
                 );
               })}
@@ -1732,33 +1942,33 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
               className={`secondary ${active_settings_tab === "general" ? "active-tab" : ""}`}
               onClick={() => setActiveSettingsTab("general")}
             >
-              Общее моделирование
+              РћР±С‰РµРµ РјРѕРґРµР»РёСЂРѕРІР°РЅРёРµ
             </button>
             <button
               type="button"
               className={`secondary ${active_settings_tab === "nodes" ? "active-tab" : ""}`}
               onClick={() => setActiveSettingsTab("nodes")}
             >
-              Параметры вершины
+              РџР°СЂР°РјРµС‚СЂС‹ РІРµСЂС€РёРЅС‹
             </button>
           </div>
 
           {active_settings_tab === "general" ? (
             <section className="editor-section">
-              <h3>Общие настройки моделирования</h3>
+              <h3>РћР±С‰РёРµ РЅР°СЃС‚СЂРѕР№РєРё РјРѕРґРµР»РёСЂРѕРІР°РЅРёСЏ</h3>
               <div className="editor-grid">
                 <label>
-                  Название модели
+                  РќР°Р·РІР°РЅРёРµ РјРѕРґРµР»Рё
                   <input
                     type="text"
                     value={model_name}
                     onChange={(event) => setModelName(event.target.value)}
-                    placeholder="Введите название модели"
+                    placeholder="Р’РІРµРґРёС‚Рµ РЅР°Р·РІР°РЅРёРµ РјРѕРґРµР»Рё"
                   />
                 </label>
 
                 <label>
-                  Длительность моделирования (мин)
+                  Р”Р»РёС‚РµР»СЊРЅРѕСЃС‚СЊ РјРѕРґРµР»РёСЂРѕРІР°РЅРёСЏ (РјРёРЅ)
                   <input
                     type="number"
                     min={1}
@@ -1774,12 +1984,12 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                 </label>
 
                 <label>
-                  Сид моделирования
+                  РЎРёРґ РјРѕРґРµР»РёСЂРѕРІР°РЅРёСЏ
                   <input
                     type="number"
                     step={1}
                     value={config.random_seed === null ? "" : String(config.random_seed)}
-                    placeholder="Пусто — случайный"
+                    placeholder="РџСѓСЃС‚Рѕ вЂ” СЃР»СѓС‡Р°Р№РЅС‹Р№"
                     onChange={(event) => {
                       const next_config = CloneConfig(config);
                       const parsed = ParseOptionalNumber(event.target.value);
@@ -1790,7 +2000,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                 </label>
 
                 <label>
-                  Максимум заявок
+                  РњР°РєСЃРёРјСѓРј Р·Р°СЏРІРѕРє
                   <select
                     value={ToSelectValue(config.max_requests)}
                     onChange={(event) => {
@@ -1807,7 +2017,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                         {option}
                       </option>
                     ))}
-                    <option value="none">Без ограничения</option>
+                    <option value="none">Р‘РµР· РѕРіСЂР°РЅРёС‡РµРЅРёСЏ</option>
                   </select>
                 </label>
               </div>
@@ -1816,11 +2026,11 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
 
           {active_settings_tab === "nodes" ? (
             <section className="editor-section">
-              <h3>Узлы</h3>
+              <h3>РЈР·Р»С‹</h3>
 
               <div className="action-row">
                 <button type="button" onClick={HandleAddNode}>
-                  Добавить узел обслуживания
+                  Р”РѕР±Р°РІРёС‚СЊ СѓР·РµР» РѕР±СЃР»СѓР¶РёРІР°РЅРёСЏ
                 </button>
                 <button
                   type="button"
@@ -1828,21 +2038,21 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                   onClick={HandleRemoveSelectedNode}
                   disabled={!selected_node_id}
                 >
-                  Удалить выбранный узел
+                  РЈРґР°Р»РёС‚СЊ РІС‹Р±СЂР°РЅРЅС‹Р№ СѓР·РµР»
                 </button>
               </div>
 
               <div className="editor-grid">
                 <label>
-                  Активный узел
+                  РђРєС‚РёРІРЅС‹Р№ СѓР·РµР»
                   <select
                     value={selected_node_id ?? ""}
                     onChange={(event) => setSelectedNodeId(event.target.value || null)}
                   >
-                    <option value="">Не выбран</option>
+                    <option value="">РќРµ РІС‹Р±СЂР°РЅ</option>
                     {config.nodes.map((node) => (
                       <option key={node.node_id} value={node.node_id}>
-                        {node.node_id} · {node.name}
+                        {node.node_id} В· {node.name}
                       </option>
                     ))}
                   </select>
@@ -1853,21 +2063,21 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                 <>
                   <div className="editor-grid">
                     <label>
-                      Тип узла
+                      РўРёРї СѓР·Р»Р°
                       <select
                         value={selected_node.node_type}
                         onChange={(event) =>
                           HandleSelectedNodeTypeChange(event.target.value as NodeConfig["node_type"])
                         }
                       >
-                        <option value="service">Узел обслуживания</option>
-                        <option value="generator">Генератор заявок</option>
-                        <option value="exit">Выход из системы</option>
+                        <option value="service">РЈР·РµР» РѕР±СЃР»СѓР¶РёРІР°РЅРёСЏ</option>
+                        <option value="generator">Р“РµРЅРµСЂР°С‚РѕСЂ Р·Р°СЏРІРѕРє</option>
+                        <option value="exit">Р’С‹С…РѕРґ РёР· СЃРёСЃС‚РµРјС‹</option>
                       </select>
                     </label>
 
                     <label>
-                      Название узла
+                      РќР°Р·РІР°РЅРёРµ СѓР·Р»Р°
                       <input
                         type="text"
                         value={selected_node.name}
@@ -1876,13 +2086,13 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                             node.name = event.target.value;
                           });
                         }}
-                        placeholder="Введите название узла"
+                        placeholder="Р’РІРµРґРёС‚Рµ РЅР°Р·РІР°РЅРёРµ СѓР·Р»Р°"
                       />
                     </label>
 
                     {selected_node.node_type === "service" ? (
                       <label>
-                        Каналы обслуживания
+                        РљР°РЅР°Р»С‹ РѕР±СЃР»СѓР¶РёРІР°РЅРёСЏ
                         <input
                           type="number"
                           min={1}
@@ -1901,55 +2111,95 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                       </label>
                     ) : null}
 
-                    <label>
-                      Открытие узла
-                      <input
-                        type="number"
-                        min={0}
-                        step={0.1}
-                        value={String(selected_node.open_time)}
-                        onChange={(event) => {
-                          UpdateSelectedNode((node) => {
-                            const parsed = ParseOptionalNumber(event.target.value);
-                            if (parsed === null) {
-                              return;
-                            }
-                            node.open_time = Math.max(0, parsed);
-                          });
-                        }}
-                      />
-                    </label>
-
-                    <label>
-                      Закрытие узла
-                      <input
-                        type="number"
-                        min={0}
-                        step={0.1}
-                        value={selected_node.close_time === null ? "" : String(selected_node.close_time)}
-                        placeholder="Empty - node stays open"
-                        onChange={(event) => {
-                          UpdateSelectedNode((node) => {
-                            const parsed = ParseOptionalNumber(event.target.value);
-                            node.close_time = parsed === null ? null : Math.max(0, parsed);
-                          });
-                        }}
-                      />
-                    </label>
                   </div>
+
+                  {selected_node.node_type === "service" ? (
+                    <div className="node-schedule-block">
+                      <div className="routes-header">
+                        <h4>Р“СЂР°С„РёРє СЂР°Р±РѕС‚С‹</h4>
+                        <button
+                          type="button"
+                          onClick={HandleAddScheduleInterval}
+                          disabled={!can_add_schedule_interval}
+                        >
+                          Р”РѕР±Р°РІРёС‚СЊ РёРЅС‚РµСЂРІР°Р»
+                        </button>
+                      </div>
+
+                      <div className="node-schedule-list">
+                        {selected_node_schedule.map((schedule_interval, interval_index) => (
+                          <div
+                            key={`${selected_node.node_id}_schedule_${interval_index}`}
+                            className="editor-grid node-schedule-row"
+                          >
+                            <label>
+                              РћС‚РєСЂС‹РІР°РµС‚СЃСЏ РІ
+                              <input
+                                type="number"
+                                min={0}
+                                step={0.1}
+                                value={String(schedule_interval.open_time)}
+                                onChange={(event) =>
+                                  HandleScheduleIntervalChange(
+                                    interval_index,
+                                    "open_time",
+                                    event.target.value,
+                                  )
+                                }
+                              />
+                            </label>
+
+                            <label>
+                              Р—Р°РєСЂС‹РІР°РµС‚СЃСЏ РІ
+                              <input
+                                type="number"
+                                min={0}
+                                step={0.1}
+                                value={
+                                  schedule_interval.close_time === null
+                                    ? ""
+                                    : String(schedule_interval.close_time)
+                                }
+                                placeholder="РџСѓСЃС‚Рѕ вЂ” РЅРµ Р·Р°РєСЂС‹РІР°РµС‚СЃСЏ"
+                                onChange={(event) =>
+                                  HandleScheduleIntervalChange(
+                                    interval_index,
+                                    "close_time",
+                                    event.target.value,
+                                  )
+                                }
+                              />
+                            </label>
+
+                            <div className="node-schedule-actions">
+                              <button
+                                type="button"
+                                className="secondary small"
+                                onClick={() => HandleRemoveScheduleInterval(interval_index)}
+                                disabled={selected_node_schedule.length <= 1}
+                              >
+                                РЈРґР°Р»РёС‚СЊ РёРЅС‚РµСЂРІР°Р»
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
 
                   {selected_node.node_type === "generator" ? (
                     <>
                       <div className="editor-grid">
                         <label>
-                          Время старта генератора
+                          Р’СЂРµРјСЏ СЃС‚Р°СЂС‚Р° РіРµРЅРµСЂР°С‚РѕСЂР°
                           <select
-                            value={String(config.generator.start_time)}
+                            value={String(config.generator?.start_time ?? 0)}
                             onChange={(event) => {
                               const next_config = CloneConfig(config);
-                              next_config.generator.start_time = ParseSelectNumber(
+                              const generator_config = EnsureGeneratorConfig(next_config);
+                              generator_config.start_time = ParseSelectNumber(
                                 event.target.value,
-                                config.generator.start_time,
+                                config.generator?.start_time ?? 0,
                               );
                               CommitModel(next_config, { ...node_positions });
                             }}
@@ -1963,22 +2213,23 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                         </label>
 
                         <label>
-                          Время остановки генератора
+                          Р’СЂРµРјСЏ РѕСЃС‚Р°РЅРѕРІРєРё РіРµРЅРµСЂР°С‚РѕСЂР°
                           <select
-                            value={ToSelectValue(config.generator.stop_time)}
+                            value={ToSelectValue(config.generator?.stop_time ?? null)}
                             onChange={(event) => {
                               const next_config = CloneConfig(config);
-                              next_config.generator.stop_time =
+                              const generator_config = EnsureGeneratorConfig(next_config);
+                              generator_config.stop_time =
                                 event.target.value === "none"
                                   ? null
                                   : ParseSelectNumber(
                                       event.target.value,
-                                      config.generator.stop_time ?? config.simulation_duration,
+                                      config.generator?.stop_time ?? config.simulation_duration,
                                     );
                               CommitModel(next_config, { ...node_positions });
                             }}
                           >
-                            <option value="none">Не останавливать</option>
+                            <option value="none">РќРµ РѕСЃС‚Р°РЅР°РІР»РёРІР°С‚СЊ</option>
                             {time_options.map((option) => (
                               <option key={option} value={option}>
                                 {option}
@@ -1989,11 +2240,15 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                       </div>
 
                       <DistributionEditor
-                        title="Закон генерации заявок"
-                        distribution={config.generator.interarrival_distribution}
+                        title="Р—Р°РєРѕРЅ РіРµРЅРµСЂР°С†РёРё Р·Р°СЏРІРѕРє"
+                        distribution={
+                          config.generator?.interarrival_distribution ??
+                          CreateInterarrivalDistribution()
+                        }
                         on_change={(next_distribution) => {
                           const next_config = CloneConfig(config);
-                          next_config.generator.interarrival_distribution = next_distribution;
+                          const generator_config = EnsureGeneratorConfig(next_config);
+                          generator_config.interarrival_distribution = next_distribution;
                           CommitModel(next_config, { ...node_positions });
                         }}
                         allowed_types={generator_distribution_types}
@@ -2004,7 +2259,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
 
                   {selected_node.node_type === "service" && selected_node.service_distribution ? (
                     <DistributionEditor
-                      title="Распределение времени обслуживания узла"
+                      title="Р Р°СЃРїСЂРµРґРµР»РµРЅРёРµ РІСЂРµРјРµРЅРё РѕР±СЃР»СѓР¶РёРІР°РЅРёСЏ СѓР·Р»Р°"
                       distribution={selected_node.service_distribution}
                       on_change={(next_distribution) => {
                         UpdateSelectedNode((node) => {
@@ -2019,9 +2274,9 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                   {selected_node.node_type !== "exit" ? (
                     <div className="routes-block">
                       <div className="routes-header">
-                        <h4>Маршруты заявок</h4>
+                        <h4>РњР°СЂС€СЂСѓС‚С‹ Р·Р°СЏРІРѕРє</h4>
                         <button type="button" onClick={HandleAddRouteForSelectedNode}>
-                          Добавить маршрут
+                          Р”РѕР±Р°РІРёС‚СЊ РјР°СЂС€СЂСѓС‚
                         </button>
                       </div>
 
@@ -2029,9 +2284,9 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                         <table className="routes-table">
                           <thead>
                             <tr>
-                              <th>Название ребра</th>
-                              <th>Куда идет</th>
-                              <th>Вероятность, %</th>
+                              <th>РќР°Р·РІР°РЅРёРµ СЂРµР±СЂР°</th>
+                              <th>РљСѓРґР° РёРґРµС‚</th>
+                              <th>Р’РµСЂРѕСЏС‚РЅРѕСЃС‚СЊ, %</th>
                               <th className="route-action-header" />
                               <th className="route-action-header" />
                             </tr>
@@ -2062,8 +2317,8 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                                       }
                                       placeholder={
                                         route.target_node_id === null
-                                          ? "Сначала выберите цель"
-                                          : "Введите название ребра"
+                                          ? "РЎРЅР°С‡Р°Р»Р° РІС‹Р±РµСЂРёС‚Рµ С†РµР»СЊ"
+                                          : "Р’РІРµРґРёС‚Рµ РЅР°Р·РІР°РЅРёРµ СЂРµР±СЂР°"
                                       }
                                     />
                                   </td>
@@ -2077,13 +2332,13 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                                         HandleRouteTargetChange(route_index, event.target.value)
                                       }
                                     >
-                                      <option value="exit">Выход из системы</option>
+                                      <option value="exit">Р’С‹С…РѕРґ РёР· СЃРёСЃС‚РµРјС‹</option>
                                       {config.nodes
                                         .filter((node) => node.node_id !== selected_node.node_id)
                                         .filter((node) => node.node_type !== "generator")
                                         .map((node) => (
                                           <option key={node.node_id} value={node.node_id}>
-                                            {node.node_id} · {node.name}
+                                            {node.node_id} В· {node.name}
                                           </option>
                                         ))}
                                     </select>
@@ -2107,15 +2362,15 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                                     <button
                                       type="button"
                                       className="secondary small"
-                                      aria-label="Изменить маршрут"
-                                      title="Изменить маршрут"
+                                      aria-label="РР·РјРµРЅРёС‚СЊ РјР°СЂС€СЂСѓС‚"
+                                      title="РР·РјРµРЅРёС‚СЊ РјР°СЂС€СЂСѓС‚"
                                       onClick={(event) => {
                                         event.stopPropagation();
                                         setSelectedRouteForEdgeSettings(String(route_index));
                                       }}
                                     >
                                       <span className="route-action-icon" aria-hidden="true">
-                                        ✎
+                                        вњЋ
                                       </span>
                                     </button>
                                   </td>
@@ -2123,8 +2378,8 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                                     <button
                                       type="button"
                                       className="secondary small route-remove-button"
-                                      aria-label="Удалить маршрут"
-                                      title="Удалить маршрут"
+                                      aria-label="РЈРґР°Р»РёС‚СЊ РјР°СЂС€СЂСѓС‚"
+                                      title="РЈРґР°Р»РёС‚СЊ РјР°СЂС€СЂСѓС‚"
                                       disabled={selected_node.routes.length <= 1}
                                       onClick={(event) => {
                                         event.stopPropagation();
@@ -2132,7 +2387,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                                       }}
                                     >
                                       <span className="route-action-icon" aria-hidden="true">
-                                        🗑
+                                        рџ—‘
                                       </span>
                                     </button>
                                   </td>
@@ -2143,7 +2398,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                           <tfoot>
                             <tr>
                               <td colSpan={2} className="routes-summary-title">
-                                Суммарная вероятность перехода
+                                РЎСѓРјРјР°СЂРЅР°СЏ РІРµСЂРѕСЏС‚РЅРѕСЃС‚СЊ РїРµСЂРµС…РѕРґР°
                               </td>
                               <td
                                 className={`routes-summary-value ${
@@ -2152,7 +2407,7 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                               >
                                 {selected_node_probability_percent !== null
                                   ? `${selected_node_probability_percent.toFixed(2)}%`
-                                  : "—"}
+                                  : "вЂ”"}
                               </td>
                               <td className="routes-summary-empty" />
                               <td className="routes-summary-empty" />
@@ -2163,14 +2418,14 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
 
                       {!selected_node_probability_is_valid ? (
                         <div className="route-probability-warning">
-                          Суммарная вероятность перехода должна быть 100%.
+                          РЎСѓРјРјР°СЂРЅР°СЏ РІРµСЂРѕСЏС‚РЅРѕСЃС‚СЊ РїРµСЂРµС…РѕРґР° РґРѕР»Р¶РЅР° Р±С‹С‚СЊ 100%.
                         </div>
                       ) : null}
 
                       <div className="route-edge-settings">
                         {selected_route_edge && selected_route_index_for_edge_settings !== null ? (
                           <DistributionEditor
-                            title={`Параметры ребра ${selected_route_edge.edge_id}`}
+                            title={`РџР°СЂР°РјРµС‚СЂС‹ СЂРµР±СЂР° ${selected_route_edge.edge_id}`}
                             distribution={selected_route_edge.travel_distribution}
                             on_change={(next_distribution) =>
                               HandleRouteEdgeDistributionChange(
@@ -2183,19 +2438,19 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
                           />
                         ) : selected_route_for_edge_distribution ? (
                           <div className="muted-text">
-                            Ребро с таким названием уже используется в другом маршруте.
-                            Укажите уникальное название ребра.
+                            Р РµР±СЂРѕ СЃ С‚Р°РєРёРј РЅР°Р·РІР°РЅРёРµРј СѓР¶Рµ РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ РІ РґСЂСѓРіРѕРј РјР°СЂС€СЂСѓС‚Рµ.
+                            РЈРєР°Р¶РёС‚Рµ СѓРЅРёРєР°Р»СЊРЅРѕРµ РЅР°Р·РІР°РЅРёРµ СЂРµР±СЂР°.
                           </div>
                         ) : (
                           <div className="muted-text">
-                            Для настройки параметров ребра задайте для маршрута цель и название,
-                            затем выберите строку ребра в таблице.
+                            Р”Р»СЏ РЅР°СЃС‚СЂРѕР№РєРё РїР°СЂР°РјРµС‚СЂРѕРІ СЂРµР±СЂР° Р·Р°РґР°Р№С‚Рµ РґР»СЏ РјР°СЂС€СЂСѓС‚Р° С†РµР»СЊ Рё РЅР°Р·РІР°РЅРёРµ,
+                            Р·Р°С‚РµРј РІС‹Р±РµСЂРёС‚Рµ СЃС‚СЂРѕРєСѓ СЂРµР±СЂР° РІ С‚Р°Р±Р»РёС†Рµ.
                           </div>
                         )}
                       </div>
                     </div>
                   ) : (
-                    <div className="muted-text">Узел выхода не имеет исходящих маршрутов и параметров обслуживания.</div>
+                    <div className="muted-text">РЈР·РµР» РІС‹С…РѕРґР° РЅРµ РёРјРµРµС‚ РёСЃС…РѕРґСЏС‰РёС… РјР°СЂС€СЂСѓС‚РѕРІ Рё РїР°СЂР°РјРµС‚СЂРѕРІ РѕР±СЃР»СѓР¶РёРІР°РЅРёСЏ.</div>
                   )}
                 </>
               ) : null}
@@ -2208,4 +2463,5 @@ export function EditorPage({ on_run_ready }: EditorPageProps) {
     </section>
   );
 }
+
 

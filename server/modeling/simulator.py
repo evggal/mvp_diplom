@@ -8,7 +8,14 @@ import numpy as np
 import pandas as pd
 
 from .distributions import SampleFromDistribution
-from .schemas import DistributionConfig, EdgeConfig, NodeConfig, RouteConfig, SimulationConfig
+from .schemas import (
+    DistributionConfig,
+    EdgeConfig,
+    GeneratorConfig,
+    NodeConfig,
+    RouteConfig,
+    SimulationConfig,
+)
 
 
 EVENT_REQUEST_GENERATED = "request_generated"
@@ -42,12 +49,12 @@ class RequestRuntime:
 class NodeRuntime:
     node_id: str
     name: str
-    open_time: float
-    close_time: float | None
+    schedule_windows: list[tuple[float, float | None]]
     channels: int
     queue: list[str] = field(default_factory=list)
     queue_arrival_times: dict[str, float] = field(default_factory=dict)
     active_service_start: dict[str, float] = field(default_factory=dict)
+    planned_recheck_times: set[float] = field(default_factory=set)
     busy_channels: int = 0
     queue_area: float = 0.0
     busy_area: float = 0.0
@@ -122,6 +129,54 @@ def FindEdge(edge_lookup: dict[str, EdgeConfig], edge_id: str) -> EdgeConfig:
     if edge_id not in edge_lookup:
         raise ValueError(f"Unknown edge_id '{edge_id}' in route")
     return edge_lookup[edge_id]
+
+
+def BuildScheduleWindows(node_config: NodeConfig) -> list[tuple[float, float | None]]:
+    if node_config.schedule:
+        return [
+            (max(0.0, interval.open_time), interval.close_time)
+            for interval in node_config.schedule
+        ]
+    return [(max(0.0, node_config.open_time), node_config.close_time)]
+
+
+def GetActiveScheduleWindow(
+    schedule_windows: list[tuple[float, float | None]],
+    current_time: float,
+) -> tuple[float, float | None] | None:
+    for open_time, close_time in schedule_windows:
+        if current_time < open_time:
+            return None
+        if close_time is None:
+            return (open_time, close_time)
+        if open_time <= current_time < close_time:
+            return (open_time, close_time)
+    return None
+
+
+def GetNextScheduleOpenTime(
+    schedule_windows: list[tuple[float, float | None]],
+    current_time: float,
+) -> float | None:
+    for open_time, _close_time in schedule_windows:
+        if open_time > current_time:
+            return open_time
+    return None
+
+
+def ComputeOpenDuration(
+    schedule_windows: list[tuple[float, float | None]],
+    simulation_duration: float,
+) -> float:
+    total_open_duration = 0.0
+    for open_time, close_time in schedule_windows:
+        if open_time >= simulation_duration:
+            break
+        effective_open = max(0.0, open_time)
+        effective_close = simulation_duration if close_time is None else min(close_time, simulation_duration)
+        if effective_close > effective_open:
+            total_open_duration += effective_close - effective_open
+    return total_open_duration
 
 
 def AppendEvent(
@@ -226,20 +281,24 @@ def StartServiceIfPossible(
     if node_config.node_type != "service":
         return
 
-    if current_time < node.open_time:
-        sequence_ref[0] += 1
-        heapq.heappush(
-            calendar,
-            CalendarEvent(
-                event_time=node.open_time,
-                sequence=sequence_ref[0],
-                event_type=EVENT_NODE_RECHECK,
-                node_id=node.node_id,
-            ),
-        )
-        return
-
-    if node.close_time is not None and current_time >= node.close_time:
+    if GetActiveScheduleWindow(node.schedule_windows, current_time) is None:
+        next_open_time = GetNextScheduleOpenTime(node.schedule_windows, current_time)
+        if (
+            next_open_time is not None
+            and next_open_time <= simulation_duration
+            and next_open_time not in node.planned_recheck_times
+        ):
+            node.planned_recheck_times.add(next_open_time)
+            sequence_ref[0] += 1
+            heapq.heappush(
+                calendar,
+                CalendarEvent(
+                    event_time=next_open_time,
+                    sequence=sequence_ref[0],
+                    event_type=EVENT_NODE_RECHECK,
+                    node_id=node.node_id,
+                ),
+            )
         return
 
     while node.busy_channels < node.channels and node.queue:
@@ -298,8 +357,7 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
         node_lookup[node_config.node_id] = NodeRuntime(
             node_id=node_config.node_id,
             name=node_config.name,
-            open_time=node_config.open_time,
-            close_time=node_config.close_time,
+            schedule_windows=BuildScheduleWindows(node_config),
             channels=node_config.channels,
         )
         node_routes_lookup[node_config.node_id] = node_config.routes
@@ -309,25 +367,42 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
 
     calendar: list[CalendarEvent] = []
     sequence_ref = [0]
-    generator_interval_index_ref = [0]
+    generator_interval_index_refs: dict[str, list[int]] = {}
     event_rows: list[dict[str, Any]] = []
 
-    stop_generation_time = (
-        min(config.generator.stop_time, simulation_duration)
-        if config.generator.stop_time is not None
-        else simulation_duration
+    effective_generators: list[GeneratorConfig] = (
+        config.generators if config.generators else ([config.generator] if config.generator else [])
     )
+    generator_config_lookup = {
+        generator_config.target_node_id: generator_config
+        for generator_config in effective_generators
+    }
+    generator_stop_time_lookup: dict[str, float] = {}
 
-    sequence_ref[0] += 1
-    heapq.heappush(
-        calendar,
-        CalendarEvent(
-            event_time=config.generator.start_time,
-            sequence=sequence_ref[0],
-            event_type=EVENT_REQUEST_GENERATED,
-            node_id=config.generator.target_node_id,
-        ),
-    )
+    for generator_config in effective_generators:
+        target_node_id = generator_config.target_node_id
+        stop_generation_time = (
+            min(generator_config.stop_time, simulation_duration)
+            if generator_config.stop_time is not None
+            else simulation_duration
+        )
+        start_generation_time = max(0.0, generator_config.start_time)
+        if start_generation_time > stop_generation_time:
+            continue
+
+        generator_interval_index_refs[target_node_id] = [0]
+        generator_stop_time_lookup[target_node_id] = stop_generation_time
+
+        sequence_ref[0] += 1
+        heapq.heappush(
+            calendar,
+            CalendarEvent(
+                event_time=start_generation_time,
+                sequence=sequence_ref[0],
+                event_type=EVENT_REQUEST_GENERATED,
+                node_id=target_node_id,
+            ),
+        )
 
     created_requests = 0
     exited_requests = 0
@@ -342,6 +417,17 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
         if event.event_type == EVENT_REQUEST_GENERATED:
             if config.max_requests is not None and created_requests >= config.max_requests:
                 continue
+            target_node_id = event.node_id
+            if target_node_id is None:
+                continue
+
+            if target_node_id not in generator_config_lookup:
+                continue
+
+            if target_node_id not in generator_stop_time_lookup:
+                continue
+
+            stop_generation_time = generator_stop_time_lookup[target_node_id]
             if current_time > stop_generation_time:
                 continue
 
@@ -352,7 +438,6 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
                 created_time=current_time,
             )
 
-            target_node_id = config.generator.target_node_id
             target_node = node_lookup[target_node_id]
 
             AppendEvent(
@@ -379,9 +464,9 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
             )
 
             interarrival_delay = SampleGeneratorInterarrivalDelay(
-                config.generator.interarrival_distribution,
+                generator_config_lookup[target_node_id].interarrival_distribution,
                 rng,
-                generator_interval_index_ref,
+                generator_interval_index_refs[target_node_id],
             )
             next_generation_time = current_time + interarrival_delay
             if next_generation_time <= stop_generation_time:
@@ -479,6 +564,7 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
 
         if event.event_type == EVENT_NODE_RECHECK and event.node_id:
             node = node_lookup[event.node_id]
+            node.planned_recheck_times.discard(current_time)
             StartServiceIfPossible(
                 node=node,
                 node_routes=node_routes_lookup[node.node_id],
@@ -565,10 +651,7 @@ def RunSimulation(config: SimulationConfig) -> dict[str, Any]:
 
     metrics_rows: list[dict[str, Any]] = []
     for node in node_lookup.values():
-        close_time = node.close_time if node.close_time is not None else simulation_duration
-        effective_close = min(close_time, simulation_duration)
-        effective_open = min(max(node.open_time, 0.0), effective_close)
-        schedule_window = max(1e-9, effective_close - effective_open)
+        schedule_window = max(1e-9, ComputeOpenDuration(node.schedule_windows, simulation_duration))
         utilization = node.busy_area / (node.channels * schedule_window)
 
         metrics_rows.append(

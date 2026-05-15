@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from modeling import DeleteRun, ListSavedRuns, LoadRun
+from modeling import BuildRunExportArchive, DeleteRun, ImportRunFromZipArchive, ListSavedRuns, LoadRun
 from modeling.schemas import SimulationRunRequest
 
 from .auth import (
@@ -70,7 +71,11 @@ async def StartSimulation(
     request: SimulationRunRequest,
     user: str = Depends(GetCurrentUser),  # noqa: ARG001
 ) -> StartTaskResponse:
-    task_id = await StartSimulationTask(request.model_name, request.config)
+    task_id = await StartSimulationTask(
+        request.model_name,
+        request.config,
+        request.node_positions,
+    )
     return StartTaskResponse(task_id=task_id, status="queued")
 
 
@@ -143,4 +148,47 @@ def DeleteModel(
     return {
         "status": "deleted",
         "run_id": run_id,
+    }
+
+
+@app.get("/models/{run_id}/export")
+def ExportModelArchive(
+    run_id: str,
+    user: str = Depends(GetCurrentUser),  # noqa: ARG001
+) -> Response:
+    try:
+        archive_content, archive_name = BuildRunExportArchive(run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+    fallback_name = f"{run_id}.zip"
+    content_disposition = (
+        f'attachment; filename="{fallback_name}"; filename*=UTF-8\'\'{quote(archive_name)}'
+    )
+    return Response(
+        content=archive_content,
+        media_type="application/zip",
+        headers={"Content-Disposition": content_disposition},
+    )
+
+
+@app.post("/models/import")
+def ImportModelArchive(
+    archive_bytes: bytes = Body(..., media_type="application/zip"),
+    user: str = Depends(GetCurrentUser),  # noqa: ARG001
+) -> dict[str, Any]:
+    try:
+        imported_run = ImportRunFromZipArchive(archive_bytes)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    return {
+        "status": "imported",
+        **imported_run,
     }

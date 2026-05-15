@@ -525,6 +525,13 @@ th {
   gap: 0.8rem;
 }
 
+.models-toolbar {
+  margin-top: 0.75rem;
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
 .run-card {
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -642,6 +649,29 @@ th {
   overflow: hidden;
 }
 
+.editor-canvas-panel:fullscreen,
+.editor-canvas-panel:-webkit-full-screen {
+  width: 100vw;
+  height: 100vh;
+  border: none;
+  border-radius: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.editor-canvas-panel:fullscreen .canvas-toolbar,
+.editor-canvas-panel:-webkit-full-screen .canvas-toolbar {
+  border-bottom: 1px solid #d8e3e8;
+  padding: 0.8rem 1rem;
+}
+
+.editor-canvas-panel:fullscreen .canvas-viewport,
+.editor-canvas-panel:-webkit-full-screen .canvas-viewport {
+  height: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
 .canvas-toolbar {
   display: flex;
   gap: 0.55rem;
@@ -723,14 +753,14 @@ th {
   position: absolute;
   border: 1px solid #b1cad3;
   background: linear-gradient(160deg, #ffffff 0%, #f3fbff 100%);
-  border-radius: 14px;
+  border-radius: 12px;
   text-align: left;
   color: #1c2c36;
   display: grid;
-  gap: 0.2rem;
-  padding: 0.6rem;
+  gap: 0.1rem;
+  padding: 0.48rem 0.52rem;
   cursor: grab;
-  box-shadow: 0 8px 20px #00000012;
+  box-shadow: 0 7px 16px #00000010;
 }
 
 .node-card:active {
@@ -744,19 +774,21 @@ th {
 
 .node-card-title {
   font-weight: 700;
-  font-size: 0.92rem;
+  font-size: 0.84rem;
+  line-height: 1.15;
 }
 
 .node-card-meta {
-  font-size: 0.75rem;
+  font-size: 0.68rem;
+  line-height: 1.15;
   color: #4e6778;
 }
 
 .generator-badge {
   justify-self: start;
-  margin-top: 0.1rem;
-  font-size: 0.72rem;
-  padding: 0.14rem 0.45rem;
+  margin-top: 0.08rem;
+  font-size: 0.65rem;
+  padding: 0.12rem 0.38rem;
   border-radius: 999px;
   background: #ee9b00;
   color: #13252c;
@@ -765,9 +797,9 @@ th {
 
 .exit-badge {
   justify-self: start;
-  margin-top: 0.1rem;
-  font-size: 0.72rem;
-  padding: 0.14rem 0.45rem;
+  margin-top: 0.08rem;
+  font-size: 0.65rem;
+  padding: 0.12rem 0.38rem;
   border-radius: 999px;
   background: #e9eef2;
   color: #2f4350;
@@ -863,6 +895,32 @@ th {
   border-radius: 10px;
   padding: 0.65rem;
   background: #fffcf7;
+}
+
+.node-schedule-block {
+  margin-top: 0.7rem;
+  border: 1px solid #e3e2dc;
+  border-radius: 10px;
+  padding: 0.65rem;
+  background: #fdfcff;
+}
+
+.node-schedule-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.node-schedule-row {
+  border: 1px solid #e9e1d4;
+  border-radius: 8px;
+  padding: 0.5rem;
+  background: #ffffff;
+}
+
+.node-schedule-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.2rem;
 }
 
 .routes-header {

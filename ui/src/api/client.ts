@@ -1,5 +1,6 @@
 import axios from "axios";
 import type {
+  ImportRunResponse,
   RunData,
   SavedRun,
   SimulationRunRequest,
@@ -88,4 +89,56 @@ export async function GetRunById(run_id: string): Promise<RunData> {
 
 export async function DeleteRunById(run_id: string): Promise<void> {
   await api_client.delete(`/models/${run_id}`);
+}
+
+function DecodeFileName(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function ParseDispositionFileName(disposition_header: string | undefined, fallback: string): string {
+  if (!disposition_header) {
+    return fallback;
+  }
+
+  const utf_match = disposition_header.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf_match?.[1]) {
+    const decoded = DecodeFileName(utf_match[1].trim());
+    if (decoded) {
+      return decoded;
+    }
+  }
+
+  const file_match = disposition_header.match(/filename="?([^\";]+)"?/i);
+  if (file_match?.[1]) {
+    const normalized = file_match[1].trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return fallback;
+}
+
+export async function ExportRunZip(run_id: string): Promise<{ blob: Blob; file_name: string }> {
+  const response = await api_client.get<Blob>(`/models/${run_id}/export`, {
+    responseType: "blob",
+  });
+  const file_name = ParseDispositionFileName(response.headers["content-disposition"], `${run_id}.zip`);
+  return {
+    blob: response.data,
+    file_name,
+  };
+}
+
+export async function ImportRunZip(file: File): Promise<ImportRunResponse> {
+  const response = await api_client.post<ImportRunResponse>("/models/import", file, {
+    headers: {
+      "Content-Type": file.type || "application/zip",
+    },
+  });
+  return response.data;
 }

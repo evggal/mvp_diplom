@@ -19,7 +19,7 @@ import {
 import { Bar, Line } from "react-chartjs-2";
 import { GetRunById } from "../api/client";
 import { DismissibleError } from "../components/DismissibleError";
-import type { NodeConfig, RunData } from "../types";
+import type { NodeConfig, NodeScheduleInterval, RunData } from "../types";
 
 ChartJS.register(
   CategoryScale,
@@ -453,7 +453,38 @@ function BuildQueueStatsByNode(events: PlaybackEvent[], node_ids: string[]): Rec
 }
 
 function IsNodeOpen(node: NodeConfig, current_time: number): boolean {
-  return current_time >= node.open_time && (node.close_time === null || current_time < node.close_time);
+  const schedule = NormalizeNodeSchedule(node);
+  return schedule.some((interval) => {
+    const close_time = interval.close_time;
+    if (close_time === null) {
+      return current_time >= interval.open_time;
+    }
+    return current_time >= interval.open_time && current_time < close_time;
+  });
+}
+
+function NormalizeNodeSchedule(node: NodeConfig): NodeScheduleInterval[] {
+  const fallback: NodeScheduleInterval = {
+    open_time: Math.max(0, node.open_time),
+    close_time: node.close_time,
+  };
+  const source = node.schedule && node.schedule.length > 0 ? node.schedule : [fallback];
+  return source
+    .map((interval) => ({
+      open_time: Math.max(0, interval.open_time),
+      close_time: interval.close_time,
+    }))
+    .sort((first, second) => first.open_time - second.open_time);
+}
+
+function FormatNodeSchedule(node: NodeConfig): string {
+  return NormalizeNodeSchedule(node)
+    .map((interval) =>
+      interval.close_time === null
+        ? `${interval.open_time} - открыт`
+        : `${interval.open_time} - ${interval.close_time}`,
+    )
+    .join("; ");
 }
 
 export function ResultsPage() {
@@ -1446,9 +1477,9 @@ export function ResultsPage() {
                   </>
                 ) : null}
                 <div className="summary-item">
-                  <strong>Открытие / закрытие</strong>
+                  <strong>График работы</strong>
                   <span>
-                    {selected_node.open_time} / {selected_node.close_time ?? "не закрывается"}
+                    {FormatNodeSchedule(selected_node)}
                   </span>
                 </div>
                 <div className="summary-item">

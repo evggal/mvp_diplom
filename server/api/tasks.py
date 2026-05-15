@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from modeling import RunSimulation, SaveRunArtifacts
-from modeling.schemas import SimulationConfig
+from modeling.schemas import NodePosition, SimulationConfig
 
 
 task_registry: dict[str, dict[str, Any]] = {}
@@ -36,7 +36,12 @@ async def SetTaskStatus(task_id: str, status: str, **updates: Any) -> None:
         task_data.update(updates)
 
 
-async def ExecuteSimulationTask(task_id: str, model_name: str, config: SimulationConfig) -> None:
+async def ExecuteSimulationTask(
+    task_id: str,
+    model_name: str,
+    config: SimulationConfig,
+    node_positions: dict[str, NodePosition],
+) -> None:
     await SetTaskStatus(task_id, "running")
 
     try:
@@ -51,6 +56,10 @@ async def ExecuteSimulationTask(task_id: str, model_name: str, config: Simulatio
         model_payload = {
             "model_name": model_name,
             "config": config.model_dump(mode="json"),
+            "node_positions": {
+                node_id: position.model_dump(mode="json")
+                for node_id, position in node_positions.items()
+            },
         }
         storage_result = await asyncio.to_thread(
             SaveRunArtifacts,
@@ -71,7 +80,11 @@ async def ExecuteSimulationTask(task_id: str, model_name: str, config: Simulatio
         await SetTaskStatus(task_id, "failed", error=str(exc))
 
 
-async def StartSimulationTask(model_name: str, config: SimulationConfig) -> str:
+async def StartSimulationTask(
+    model_name: str,
+    config: SimulationConfig,
+    node_positions: dict[str, NodePosition] | None = None,
+) -> str:
     task_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
 
@@ -87,7 +100,9 @@ async def StartSimulationTask(model_name: str, config: SimulationConfig) -> str:
             "files": None,
         }
 
-    asyncio.create_task(ExecuteSimulationTask(task_id, model_name, config))
+    asyncio.create_task(
+        ExecuteSimulationTask(task_id, model_name, config, node_positions or {}),
+    )
     return task_id
 
 
